@@ -88,20 +88,43 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
     
     # Use tqdm for progress bar
     with tqdm(total=len(train_loader)) as t:
-        for i, (train_batch, labels_batch) in enumerate(train_loader):
+        for batch_idx, (train_batch, labels_batch) in enumerate(train_loader):
             train_batch = train_batch.cuda(non_blocking=True)
             labels_batch = labels_batch.cuda(non_blocking=True)
             
+            # 计算sample_ids（基于batch索引和batch size）
+            batch_size = train_batch.size(0)
+            sample_ids = [batch_idx * args.batch_size + j for j in range(batch_size)]
+            
             # compute model output and loss
-            output_batch, x_m, x_stu = model(train_batch) 
+            model_output = model(train_batch, sample_ids=sample_ids)
+            
+            # 处理不同的返回值情况
+            if len(model_output) == 4:
+                output_batch, x_m, x_stu, ensemble_logit = model_output
+                use_ensemble = True
+            else:
+                output_batch, x_m, x_stu = model_output 
+                use_ensemble = False
+            
             loss_true = 0
             loss_group = 0    
             for i in range(args.num_branches - 1):
                 loss_true += criterion(output_batch[:,:,i], labels_batch)
-                loss_group += criterion_T(output_batch[:,:,i], x_m[:,:,i])
-            # loss_true = loss_true / args.num_branches        
-            # loss_group = loss_group / args.num_branches
-            loss = loss_true + criterion(x_stu, labels_batch) + args.alpha * consistency_weight * (loss_group + criterion_T(x_stu, torch.mean(output_batch, dim = 2)))
+                if use_ensemble:
+                    # 第一个蒸馏损失：使用自适应加权的 ensemble_logit 作为教师信号
+                    loss_group += criterion_T(output_batch[:,:,i], ensemble_logit)
+                else:
+                    # 原始方法：使用注意力加权的结果
+                    loss_group += criterion_T(output_batch[:,:,i], x_m[:,:,i])
+            
+            # 第二个蒸馏损失：领导分支学习 ensemble_logit 或简单平均
+            if use_ensemble:
+                student_distill_loss = criterion_T(x_stu, ensemble_logit)
+            else:
+                student_distill_loss = criterion_T(x_stu, torch.mean(output_batch, dim = 2))
+            
+            loss = loss_true + criterion(x_stu, labels_batch) + args.alpha * consistency_weight * (loss_group + student_distill_loss)
         
             loss_true_avg.update(loss_true.item())
             loss_group_avg.update(loss_group.item())
@@ -183,21 +206,44 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, consist
     end = time.time()
     
     with torch.no_grad():
-        for _, (test_batch, labels_batch) in enumerate(test_loader):
+        for batch_idx, (test_batch, labels_batch) in enumerate(test_loader):
             test_batch = test_batch.cuda(non_blocking=True)
             labels_batch = labels_batch.cuda(non_blocking=True)
+            
+            # 计算sample_ids（基于batch索引和batch size）
+            batch_size = test_batch.size(0)
+            sample_ids = [batch_idx * args.batch_size + j for j in range(batch_size)]
             
             # compute model output and loss
             loss_true = 0
             loss_group = 0
     
-            output_batch, x_m, x_stu = model(test_batch)
+            model_output = model(test_batch, sample_ids=sample_ids)
+            
+            # 处理不同的返回值情况
+            if len(model_output) == 4:
+                output_batch, x_m, x_stu, ensemble_logit = model_output
+                use_ensemble = True
+            else:
+                output_batch, x_m, x_stu = model_output
+                use_ensemble = False
+            
             for i in range(args.num_branches - 1):
                 loss_true += criterion(output_batch[:,:,i], labels_batch)
-                loss_group += criterion_T(output_batch[:,:,i], x_m[:,:,i])
-            # loss_true = loss_true / args.num_branches        
-            # loss_group = loss_group / args.num_branches
-            loss = loss_true + criterion(x_stu, labels_batch) + args.alpha * consistency_weight * (loss_group + criterion_T(x_stu, torch.mean(output_batch, dim = 2)))
+                if use_ensemble:
+                    # 第一个蒸馏损失：使用自适应加权的 ensemble_logit 作为教师信号
+                    loss_group += criterion_T(output_batch[:,:,i], ensemble_logit)
+                else:
+                    # 原始方法：使用注意力加权的结果
+                    loss_group += criterion_T(output_batch[:,:,i], x_m[:,:,i])
+            
+            # 第二个蒸馏损失：领导分支学习 ensemble_logit 或简单平均
+            if use_ensemble:
+                student_distill_loss = criterion_T(x_stu, ensemble_logit)
+            else:
+                student_distill_loss = criterion_T(x_stu, torch.mean(output_batch, dim = 2))
+            
+            loss = loss_true + criterion(x_stu, labels_batch) + args.alpha * consistency_weight * (loss_group + student_distill_loss)
     
             loss_true_avg.update(loss_true.item())
             loss_group_avg.update(loss_group.item())
@@ -326,6 +372,15 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         # Evaluate for one epoch on validation set
         test_metrics = evaluate(test_loader, model, criterion, criterion_T, accuracy, args, consistency_weight) 
         
+        # 更新历史记录（在epoch结束时）
+        if hasattr(model, 'update_epoch_history'):
+            # 如果使用DataParallel
+            if isinstance(model, nn.DataParallel):
+                model.module.update_epoch_history()
+            else:
+                model.update_epoch_history()
+            logging.info(f"- Updated epoch history. Epoch count: {model.epoch_count if not isinstance(model, nn.DataParallel) else model.module.epoch_count}")
+        
         # Find the best accTop1 for Branch1.
         if choose_E:
             test_acc = test_metrics['test_accTop1']
@@ -401,7 +456,7 @@ if __name__ == '__main__':
     if args.dataset == 'CIFAR10':
         num_classes = 10
         model_folder = "model_cifar"
-        root='/home/chendefang/MC/Data'
+        root='/home/howhow/OKDDip/Data'
     elif args.dataset == 'CIFAR100':
         num_classes = 100
         model_folder = "model_cifar"
