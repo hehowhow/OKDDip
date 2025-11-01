@@ -52,7 +52,13 @@ class VGG(nn.Module):
     
         input_channel = 512
         self.query_weight = nn.Linear(input_channel, input_channel//factor, bias = False)
-        self.key_weight = nn.Linear(input_channel, input_channel//factor, bias = False)        
+        self.key_weight = nn.Linear(input_channel, input_channel//factor, bias = False)
+        
+        # 自适应加权模块的状态追踪
+        self.use_adaptive_weighting = True  # 是否启用自适应加权
+        self.epoch_count = 0  # 当前epoch计数（从0开始）
+        self.prev_ensem_logits = {}  # 字典：{sample_id: tensor}，存储每个样本上一轮的ensemble logit
+        self.current_epoch_ensem_logits = {}  # 字典：存储当前epoch内的ensemble logit
         
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -74,7 +80,85 @@ class VGG(nn.Module):
         layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
         return nn.Sequential(*layers)
     
-    def forward(self, x):
+    def compute_wasserstein_dissimilarities(self, logitlist, sample_ids=None):
+        """
+        计算各分支logit与历史ensemble logit的一阶Wasserstein距离（样本级别）- 优化版本
+        
+        参数:
+            logitlist: list of tensors，每个tensor shape为[batch_size, num_classes]
+            sample_ids: list，长度为batch_size，每个元素是样本的唯一标识符
+        
+        返回:
+            dissimilarities: list of tensors，长度等于分支数，每个tensor shape为[batch_size]
+                            表示该分支每个样本的归一化相异度权重（所有分支权重和为1）
+        """
+        # 第一个epoch：返回均匀权重
+        if self.epoch_count == 0 or sample_ids is None or len(self.prev_ensem_logits) == 0:
+            batch_size = logitlist[0].size(0)
+            num_branches = len(logitlist)
+            uniform_weight = 1.0 / num_branches
+            return [torch.ones(batch_size, device=logitlist[0].device) * uniform_weight for _ in range(num_branches)]
+        
+        batch_size = logitlist[0].size(0)
+        device = logitlist[0].device
+        num_branches = len(logitlist)
+        num_classes = logitlist[0].size(1)
+        
+        # 优化1: 批量收集历史logits到GPU tensor
+        prev_logits_batch = torch.zeros(batch_size, num_classes, device=device)
+        valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        for i, sample_id in enumerate(sample_ids):
+            if sample_id in self.prev_ensem_logits:
+                prev_logits_batch[i] = self.prev_ensem_logits[sample_id]
+                valid_mask[i] = True
+        
+        # 优化2: 向量化计算所有分支的Wasserstein距离
+        # 堆叠所有分支的logits: [num_branches, batch_size, num_classes]
+        current_logits_stacked = torch.stack(logitlist, dim=0)
+        
+        # 批量计算概率分布和CDF
+        current_probs = F.softmax(current_logits_stacked, dim=2)  # [num_branches, batch_size, num_classes]
+        prev_probs = F.softmax(prev_logits_batch.unsqueeze(0), dim=2)  # [1, batch_size, num_classes]
+        
+        current_cdfs = torch.cumsum(current_probs, dim=2)  # [num_branches, batch_size, num_classes]
+        prev_cdfs = torch.cumsum(prev_probs, dim=2)  # [1, batch_size, num_classes]
+        
+        # 批量计算Wasserstein距离: [num_branches, batch_size]
+        wasserstein_dists = torch.sum(torch.abs(current_cdfs - prev_cdfs), dim=2)
+        
+        # 处理无历史记录的样本（设为1.0）
+        wasserstein_dists[:, ~valid_mask] = 1.0
+        
+        # 优化3: 向量化归一化
+        # 转置以便按样本归一化: [batch_size, num_branches]
+        dissim_matrix = wasserstein_dists.transpose(0, 1)
+        
+        # 批量归一化
+        total_weights = dissim_matrix.sum(dim=1, keepdim=True)  # [batch_size, 1]
+        total_weights = torch.where(total_weights > 0, total_weights, torch.ones_like(total_weights))
+        normalized_dissim = dissim_matrix / total_weights  # [batch_size, num_branches]
+        
+        # 转换为list格式（与原接口兼容）
+        return [normalized_dissim[:, i] for i in range(num_branches)]
+    
+    def update_epoch_history(self):
+        """
+        在每个epoch结束时调用，更新历史记录
+        """
+        # 将当前epoch的输出作为下一轮的历史参考
+        self.prev_ensem_logits = self.current_epoch_ensem_logits.copy()
+        # 清空当前记录
+        self.current_epoch_ensem_logits = {}
+        # 更新epoch计数
+        self.epoch_count += 1
+    
+    def forward(self, x, sample_ids=None):
+        # 生成sample_ids（如果未提供）
+        if sample_ids is None:
+            batch_size = x.size(0)
+            # 使用batch内的索引作为临时ID（训练时会被覆盖）
+            sample_ids = list(range(batch_size))
     
         x = self.conv1(x)
         x = self.bn1(x)
@@ -110,9 +194,35 @@ class VGG(nn.Module):
                 proj_q = torch.cat([proj_q, temp_q], 1) # B x num_branches x 8
                 proj_k = torch.cat([proj_k, temp_k], 1) 
             
+            # 原始注意力机制
             energy = torch.bmm(proj_q, proj_k.permute(0,2,1)) 
             attention = F.softmax(energy, dim = -1) 
             x_m = torch.bmm(pro, attention.permute(0,2,1))
+            
+            # 自适应加权融合
+            if self.use_adaptive_weighting:
+                # 将pro转换为logit列表：[batch_size, num_classes, num_branches] -> list of [batch_size, num_classes]
+                logitlist = [pro[:, :, i] for i in range(self.num_branches)]
+                
+                # 计算相异度权重
+                dissimilarities = self.compute_wasserstein_dissimilarities(logitlist, sample_ids)
+                
+                # 使用权重进行加权融合
+                batch_size = pro.size(0)
+                num_classes = pro.size(1)
+                ensemble_logit = torch.zeros(batch_size, num_classes, device=pro.device)
+                
+                for i, (logit, weight) in enumerate(zip(logitlist, dissimilarities)):
+                    weighted_logit = logit * weight.view(-1, 1)  # [batch_size, num_classes]
+                    ensemble_logit += weighted_logit
+                
+                # 存储当前epoch的ensemble输出
+                for j, sample_id in enumerate(sample_ids):
+                    self.current_epoch_ensem_logits[sample_id] = ensemble_logit[j].detach()
+                
+                # 返回：pro包含各分支logits，ensemble_logit是自适应加权后的结果
+                return pro, x_m, ensemble_logit
+            
             return pro, x_m
         else:
             for i in range(1, self.num_branches - 1):
@@ -128,6 +238,7 @@ class VGG(nn.Module):
                 proj_q = torch.cat([proj_q, temp_q], 1) # B x num_branches x 8
                 proj_k = torch.cat([proj_k, temp_k], 1) 
             
+            # 原始注意力机制
             energy =  torch.bmm(proj_q, proj_k.permute(0,2,1)) 
             attention = F.softmax(energy, dim = -1) 
             x_m = torch.bmm(pro, attention.permute(0,2,1))
@@ -135,6 +246,30 @@ class VGG(nn.Module):
             temp = getattr(self, 'layer3_'+str(self.num_branches - 1))(x)
             temp = temp.view(temp.size(0), -1)   
             temp_out = getattr(self, 'classifier3_' + str(self.num_branches - 1))(temp)
+            
+            # 自适应加权融合（仅对前num_branches-1个分支）
+            if self.use_adaptive_weighting:
+                # 将pro转换为logit列表（不包括最后一个分支）
+                logitlist = [pro[:, :, i] for i in range(self.num_branches - 1)]
+                
+                # 计算相异度权重
+                dissimilarities = self.compute_wasserstein_dissimilarities(logitlist, sample_ids)
+                
+                # 使用权重进行加权融合
+                batch_size = pro.size(0)
+                num_classes = pro.size(1)
+                ensemble_logit = torch.zeros(batch_size, num_classes, device=pro.device)
+                
+                for i, (logit, weight) in enumerate(zip(logitlist, dissimilarities)):
+                    weighted_logit = logit * weight.view(-1, 1)  # [batch_size, num_classes]
+                    ensemble_logit += weighted_logit
+                
+                # 存储当前epoch的ensemble输出
+                for j, sample_id in enumerate(sample_ids):
+                    self.current_epoch_ensem_logits[sample_id] = ensemble_logit[j].detach()
+                
+                return pro, x_m, temp_out, ensemble_logit
+            
             return pro, x_m, temp_out
 
 def vgg16(pretrained=False, path=None, **kwargs):

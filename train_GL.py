@@ -22,9 +22,10 @@ import models.model_cifar as model_cifar
 from tensorboardX import SummaryWriter
 
 # Set the random seed for reproducible experiments
-# random.seed(97)
-# torch.manual_seed(97)
-# if torch.cuda.is_available(): torch.cuda.manual_seed(97)
+random.seed(97)
+torch.manual_seed(97)
+# if torch.cuda.is_available(): 
+torch.cuda.manual_seed(97)
 torch.backends.cudnn.benchmark = True
 # torch.backends.cudnn.deterministic = True
 
@@ -59,7 +60,7 @@ parser.add_argument('--start_consistency', default=0., type=float, help = 'Input
 parser.add_argument('--length', default=80, type=float, help='length ratio: default(80)')
 parser.add_argument('--MulStu', action='store_true', help = 'Decide whether or not to calculate multiStudent: default(False)')
 parser.add_argument('--type', default='GL', type=str, help = 'Define the loss calculation strategy: default(GL)')
-parser.add_argument('--lambda_ensemble', default=0.5, type=float, help = 'Weight for ensemble_logit in teacher signal fusion: default(0.5)')
+parser.add_argument('--lambda_ensemble', default=0.2, type=float, help = 'Weight for ensemble_logit in teacher signal fusion: default(0.5)')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -439,9 +440,9 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         if is_best:
             logging.info("- Found better accuracy")            
             best_acc = test_acc            
-            # Save best metrics in a json file in the model directory (添加时间戳和数据集名称)
+            # Save best metrics in a json file in the model directory (添加模型名、时间戳和数据集名称)
             test_metrics['epoch'] = epoch + 1
-            best_metrics_filename = f"test_best_metrics_ensem_{args.dataset}_{timestamp}.json"
+            best_metrics_filename = f"test_best_metrics_ensem_0.7seed97div_{args.model}_{args.dataset}_{timestamp}.json"
             utils.save_dict_to_json(test_metrics, os.path.join(model_dir, best_metrics_filename))
         
             # Save model and optimizer
@@ -473,8 +474,8 @@ if __name__ == '__main__':
         print("Directory does not exist! Making directory {}".format(model_dir))
         os.makedirs(model_dir)
     
-    # Set the logger (添加时间戳和数据集名称)
-    log_filename = f'train_{args.dataset}_{timestamp}.log'
+    # Set the logger (添加模型名、时间戳和数据集名称)
+    log_filename = f'train_{args.model}_{args.dataset}_{timestamp}.log'
     utils.set_logger(os.path.join(model_dir, log_filename))
 
     # Create the input data pipeline
