@@ -163,6 +163,12 @@ class ResNet(nn.Module):
             self.avgpool_c = nn.AvgPool2d(16)
             self.control_v1 = nn.Linear(fix_inplanes, self.num_branches)
             self.bn_v1 = nn.BatchNorm1d(self.num_branches)
+        
+        # 自适应加权模块的状态追踪
+        self.use_adaptive_weighting = False  # 是否启用自适应加权
+        self.epoch_count = 0  # 当前epoch计数（从0开始）
+        self.prev_ensem_logits = {}  # 字典：{sample_id: tensor}，存储每个样本上一轮的ensemble logit
+        self.current_epoch_ensem_logits = {}  # 字典：存储当前epoch内的ensemble logit
 
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -205,8 +211,60 @@ class ResNet(nn.Module):
                                 norm_layer=norm_layer))
 
         return nn.Sequential(*layers)
+    
+    def compute_wasserstein_dissimilarities(self, logitlist, sample_ids=None):
+        """
+        计算各分支logit与历史ensemble logit的一阶Wasserstein距离（样本级别）- 优化版本
+        """
+        # 第一个epoch：返回均匀权重
+        if self.epoch_count == 0 or sample_ids is None or len(self.prev_ensem_logits) == 0:
+            batch_size = logitlist[0].size(0)
+            num_branches = len(logitlist)
+            uniform_weight = 1.0 / num_branches
+            return [torch.ones(batch_size, device=logitlist[0].device) * uniform_weight for _ in range(num_branches)]
         
-    def forward(self, x):
+        batch_size = logitlist[0].size(0)
+        device = logitlist[0].device
+        num_branches = len(logitlist)
+        num_classes = logitlist[0].size(1)
+        
+        # 优化1: 批量收集历史logits到GPU tensor
+        prev_logits_batch = torch.zeros(batch_size, num_classes, device=device)
+        valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        
+        for i, sample_id in enumerate(sample_ids):
+            if sample_id in self.prev_ensem_logits:
+                prev_logits_batch[i] = self.prev_ensem_logits[sample_id]
+                valid_mask[i] = True
+        
+        # 优化2: 向量化计算所有分支的Wasserstein距离
+        current_logits_stacked = torch.stack(logitlist, dim=0)
+        current_probs = F.softmax(current_logits_stacked, dim=2)
+        prev_probs = F.softmax(prev_logits_batch.unsqueeze(0), dim=2)
+        current_cdfs = torch.cumsum(current_probs, dim=2)
+        prev_cdfs = torch.cumsum(prev_probs, dim=2)
+        wasserstein_dists = torch.sum(torch.abs(current_cdfs - prev_cdfs), dim=2)
+        wasserstein_dists[:, ~valid_mask] = 1.0
+        
+        # 优化3: 向量化归一化
+        dissim_matrix = wasserstein_dists.transpose(0, 1)
+        total_weights = dissim_matrix.sum(dim=1, keepdim=True)
+        total_weights = torch.where(total_weights > 0, total_weights, torch.ones_like(total_weights))
+        normalized_dissim = dissim_matrix / total_weights
+        
+        return [normalized_dissim[:, i] for i in range(num_branches)]
+    
+    def update_epoch_history(self):
+        """在每个epoch结束时调用，更新历史记录"""
+        self.prev_ensem_logits = self.current_epoch_ensem_logits.copy()
+        self.current_epoch_ensem_logits = {}
+        self.epoch_count += 1
+        
+    def forward(self, x, sample_ids=None):
+        # 生成sample_ids（如果未提供）
+        if sample_ids is None:
+            batch_size = x.size(0)
+            sample_ids = list(range(batch_size))
 
         x = self.conv1(x)
         x = self.bn1(x)
@@ -256,6 +314,30 @@ class ResNet(nn.Module):
                 x_m = x_c[:,0].view(-1, 1).repeat(1, pro[:,:,0].size(1)) * pro[:,:,0]
                 for i in range(1, self.num_branches):
                     x_m += x_c[:,i].view(-1, 1).repeat(1, pro[:,:,i].size(1)) * pro[:,:,i]       # B x num_classes
+            
+            # 自适应加权融合
+            if self.use_adaptive_weighting:
+                # 将pro转换为logit列表
+                logitlist = [pro[:, :, i] for i in range(self.num_branches)]
+                
+                # 计算相异度权重
+                dissimilarities = self.compute_wasserstein_dissimilarities(logitlist, sample_ids)
+                
+                # 使用权重进行加权融合
+                batch_size = pro.size(0)
+                num_classes = pro.size(1)
+                ensemble_logit = torch.zeros(batch_size, num_classes, device=pro.device)
+                
+                for i, (logit, weight) in enumerate(zip(logitlist, dissimilarities)):
+                    weighted_logit = logit * weight.view(-1, 1)
+                    ensemble_logit += weighted_logit
+                
+                # 存储当前epoch的ensemble输出
+                for j, sample_id in enumerate(sample_ids):
+                    self.current_epoch_ensem_logits[sample_id] = ensemble_logit[j].detach()
+                
+                return pro, x_m, ensemble_logit
+            
             return pro, x_m
 
                 
