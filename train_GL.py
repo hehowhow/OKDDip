@@ -20,7 +20,6 @@ import models.data_loader as data_loader
 import models
 import models.model_cifar as model_cifar
 from tensorboardX import SummaryWriter
-
 # Set the random seed for reproducible experiments
 random.seed(97)
 torch.manual_seed(97)
@@ -67,6 +66,9 @@ parser.add_argument('--dissimilarity_metric', default='wasserstein1', type=str,
                     choices=['wasserstein1', 'wasserstein2', 'euclidean', 'kl', 'cosine'],
                     help = 'Dissimilarity metric for adaptive weighting: wasserstein1(default), wasserstein2, euclidean, kl, cosine')
 parser.add_argument('--tau', default=1.0, type=float, help = 'Temperature for softmax normalization in dissimilarity weighting: default(1.0)')
+parser.add_argument('--use_wandb', action='store_true', help = 'Use Weights & Biases for logging: default(False)')
+parser.add_argument('--wandb_project', default='PHR', type=str, help = 'W&B project name: default(OKDDip-GL)')
+parser.add_argument('--wandb_entity', default='swufe1hh-cstc', type=str, help = 'W&B entity (username or team): default(None)')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -399,6 +401,23 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         writerB.add_scalar('Train/AccTop1_B0', train_metrics['stu0train_accTop1'], epoch+1)
         writerB.add_scalar('Train/AccTop1_B1', train_metrics['stu1train_accTop1'], epoch+1)
         writerB.add_scalar('Train/AccTop1_B2', train_metrics['stu2train_accTop1'], epoch+1)
+        
+        # Log to wandb
+        if args.use_wandb:
+            wandb.log({
+                'epoch': epoch + 1,
+                'train/loss': train_metrics['train_loss'],
+                'train/loss_true': train_metrics['train_true_loss'],
+                'train/loss_group': train_metrics['train_group_loss'],
+                'train/acc_top1_ensemble': train_metrics['train_accTop1'],
+                'train/acc_top1_leader': train_metrics['stu_train_accTop1'],
+                'train/acc_top1_mean': train_metrics['mean_train_accTop1'],
+                'train/acc_top1_b0': train_metrics['stu0train_accTop1'],
+                'train/acc_top1_b1': train_metrics['stu1train_accTop1'],
+                'train/acc_top1_b2': train_metrics['stu2train_accTop1'],
+                'train/consistency_weight': consistency_weight,
+                'train/learning_rate': optimizer.param_groups[0]['lr'],
+            }, step=epoch+1)
     
         # Evaluate for one epoch on validation set
         test_metrics = evaluate(test_loader, model, criterion, criterion_T, accuracy, args, consistency_weight) 
@@ -427,6 +446,21 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         writerB.add_scalar('Test/AccTop1_B1', test_metrics['stu1test_accTop1'], epoch+1)
         writerB.add_scalar('Test/AccTop1_B2', test_metrics['stu2test_accTop1'], epoch+1)
         
+        # Log to wandb
+        if args.use_wandb:
+            wandb.log({
+                'test/loss': test_metrics['test_loss'],
+                'test/loss_true': test_metrics['test_true_loss'],
+                'test/loss_group': test_metrics['test_group_loss'],
+                'test/acc_top1_ensemble': test_metrics['test_accTop1'],
+                'test/acc_top1_leader': test_metrics['stu_test_accTop1'],
+                'test/acc_top1_mean': test_metrics['mean_test_accTop1'],
+                'test/acc_top1_b0': test_metrics['stu0test_accTop1'],
+                'test/acc_top1_b1': test_metrics['stu1test_accTop1'],
+                'test/acc_top1_b2': test_metrics['stu2test_accTop1'],
+                'test/diversity': test_metrics['dist'],
+            }, step=epoch+1)
+        
         result_train_metrics[epoch] = train_metrics
         result_test_metrics[epoch] = test_metrics
         
@@ -449,7 +483,11 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
             best_acc = test_acc            
             # Save best metrics in a json file in the model directory (添加模型名、时间戳和数据集名称)
             test_metrics['epoch'] = epoch + 1
-            best_metrics_filename = f"test_best_metrics_ensem_{args.gpu_id}_{args.lambda_ensemble}_tau1.5_{args.model}_{args.dataset}_{timestamp}.json"
+            best_metrics_filename = (
+                f"test_best_metrics_ensem_{args.gpu_id}_{args.lambda_ensemble}_"
+                f"{args.dissimilarity_metric}_tau{args.tau}_{args.model}_"
+                f"{args.dataset}_{timestamp}.json"
+            )
             utils.save_dict_to_json(test_metrics, os.path.join(model_dir, best_metrics_filename))
         
             # Save model and optimizer
@@ -484,6 +522,24 @@ if __name__ == '__main__':
     # Set the logger (添加模型名、时间戳和数据集名称)
     log_filename = f'train_{args.model}_{args.dataset}_{args.gpu_id}_{args.lambda_ensemble}_{timestamp}.log'
     utils.set_logger(os.path.join(model_dir, log_filename))
+    
+    # Initialize Weights & Biases
+    if args.use_wandb:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise RuntimeError(
+                "W&B logging requires `pip install wandb`."
+            ) from exc
+        run_name = f"GL_{args.model}_{args.dataset}_b{args.num_branches}_lambda{args.lambda_ensemble}_{timestamp}"
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config=vars(args),
+            dir=model_dir,
+        )
+        logging.info(f"- Initialized W&B: project={args.wandb_project}, run={run_name}")
 
     # Create the input data pipeline
     logging.info("Loading the datasets...")
@@ -563,3 +619,7 @@ if __name__ == '__main__':
     state['Total params'] = num_params
     params_json_path = os.path.join(model_dir, "parameters.json") # save parameters
     utils.save_dict_to_json(state, params_json_path)
+    # Finish W&B run
+    if args.use_wandb:
+        wandb.finish()
+        logging.info("- W&B run finished")

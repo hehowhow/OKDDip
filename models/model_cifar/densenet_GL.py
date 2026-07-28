@@ -207,7 +207,7 @@ class DenseNet(nn.Module):
         self.key_weight = nn.Linear(input_channel, input_channel//factor, bias = False)
         
         # 自适应加权模块的状态追踪
-        self.use_adaptive_weighting = False  # 是否启用自适应加权
+        self.use_adaptive_weighting = True  # 是否启用自适应加权
         self.epoch_count = 0  # 当前epoch计数（从0开始）
         self.prev_ensem_logits = {}  # 字典：{sample_id: tensor}，存储每个样本上一轮的ensemble logit
         self.current_epoch_ensem_logits = {}  # 字典：存储当前epoch内的ensemble logit
@@ -287,7 +287,6 @@ class DenseNet(nn.Module):
         self.current_epoch_ensem_logits = {}
         # 更新epoch计数
         self.epoch_count += 1
-
     def record_epoch_logits(self, sample_ids, ensemble_logits):
         """Record gathered training logits under stable dataset indices."""
         record_history_batch(

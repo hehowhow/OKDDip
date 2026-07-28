@@ -564,7 +564,6 @@ class ResNet(nn.Module):
         self.prev_ensem_logits = self.current_epoch_ensem_logits.copy()
         self.current_epoch_ensem_logits = {}
         self.epoch_count += 1
-
     def record_epoch_logits(self, sample_ids, ensemble_logits):
         """Record gathered training logits under stable dataset indices."""
         record_history_batch(

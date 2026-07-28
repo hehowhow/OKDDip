@@ -20,9 +20,10 @@ import models.data_loader as data_loader
 from tensorboardX import SummaryWriter
 
 # Fix the random seed for reproducible experiments
-# random.seed(97)
-# torch.manual_seed(97)
-# if torch.cuda.is_available(): torch.cuda.manual_seed(97)
+random.seed(97)
+torch.manual_seed(97)
+# if torch.cuda.is_available(): 
+torch.cuda.manual_seed(97)
 torch.backends.cudnn.benchmark = True
 # torch.backends.cudnn.deterministic = True
 

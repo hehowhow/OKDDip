@@ -19,9 +19,6 @@ import utils
 import models
 import models.data_loader as data_loader
 from tensorboardX import SummaryWriter
-import wandb
-
-os.environ['WANDB_API_KEY'] = '91f59aff4c5d1fdaa27e250633c3ae9e465a6664'
 # Set the random seed for reproducible experiments
 random.seed(97)
 torch.manual_seed(97)
@@ -485,6 +482,12 @@ if __name__ == '__main__':
     
     # Initialize Weights & Biases
     if args.use_wandb:
+        try:
+            import wandb
+        except ImportError as exc:
+            raise RuntimeError(
+                "W&B logging requires `pip install wandb`."
+            ) from exc
         run_name = f"ONE_{args.model}_{args.dataset}_b{args.num_branches}_lambda{args.lambda_ensemble}_{timestamp}"
         wandb.init(
             project=args.wandb_project,

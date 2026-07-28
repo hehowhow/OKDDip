@@ -122,17 +122,36 @@ python -m compileall models train_GL.py train_GL2.py train_one2.py
 
 ## 其他训练入口
 
-原始基线仍可使用：
+原始单模型和经典 KD 基线仍可使用：
 
 ```bash
 python train.py --model resnet32 --dataset CIFAR10
 python train_kd.py --model resnet32 --T_model resnet110 \
   --T_model_path ./CIFAR10/resnet110 --dataset CIFAR10
-python train_one.py --model resnet32 --dataset CIFAR10
+```
+
+ONE 及其自适应变体：
+
+```bash
+python train_one.py --model resnet32 --dataset CIFAR10 --data_root ./Data
+python train_one2.py --model resnet32 --dataset CIFAR10 --data_root ./Data
 ```
 
 带自适应历史加权的实验入口包括 `train_GL.py`、`train_GL2.py`、
-`train_GL_no_comments.py` 和 `train_one2.py`；这些入口均使用稳定数据集索引。
+`train_GL_no_comments.py`、`train_one.py` 和 `train_one2.py`；这些入口均使用稳定
+数据集索引。
+
+如需上传实验指标到 Weights & Biases，先安装并登录，然后增加
+`--use_wandb`：
+
+```bash
+pip install wandb
+wandb login
+python train_GL.py --dataset CIFAR100 --data_root ./Data --use_wandb
+```
+
+凭据由 W&B 登录状态或 `WANDB_API_KEY` 环境变量提供，仓库不会保存 API Key。
+更完整的说明见 `WANDB_SETUP.md`。
 
 ## 输出目录
 
