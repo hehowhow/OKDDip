@@ -16,11 +16,12 @@ import torch.optim as optim
 from torch.optim.lr_scheduler import MultiStepLR
 from tqdm import tqdm
 import utils
-import models.data_loader as data_loader
 import models
-import models.model_cifar as model_cifar
+import models.data_loader as data_loader
 from tensorboardX import SummaryWriter
+import wandb
 
+os.environ['WANDB_API_KEY'] = '91f59aff4c5d1fdaa27e250633c3ae9e465a6664'
 # Set the random seed for reproducible experiments
 random.seed(97)
 torch.manual_seed(97)
@@ -32,13 +33,13 @@ torch.backends.cudnn.benchmark = True
 # Set parameters
 parser = argparse.ArgumentParser()
 
-model_names = sorted(name for name in model_cifar.__dict__
+model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
-    and callable(model_cifar.__dict__[name]))
+    and callable(models.__dict__[name]))
 
 parser.add_argument('--model', metavar='ARCH', default='resnet32', type=str,
                     choices=model_names, help='model architecture: ' + ' | '.join(model_names) + ' (default: resnet32)')    
-parser.add_argument('--dataset', default='CIFAR100', type=str, help = 'Input the dataset name: default(CIFAR10)')
+parser.add_argument('--dataset', default='CIFAR10', type=str, help = 'Input the dataset name: default(CIFAR10)')
 parser.add_argument('--num_epochs', default=300, type=int, help = 'Input the number of epoches: default(300)')
 parser.add_argument('--batch_size', default=128, type=int, help = 'Input the batch size: default(128)')
 parser.add_argument('--lr', default=0.1, type=float, help = 'Input the learning rate: default(0.1)')
@@ -61,12 +62,14 @@ parser.add_argument('--alpha', default=1.0, type=float, help = 'Input the relati
 parser.add_argument('--start_consistency', default=0., type=float, help = 'Input the start consistency rate: default(0.5)')
 parser.add_argument('--length', default=80, type=float, help='length ratio: default(80)')
 parser.add_argument('--MulStu', action='store_true', help = 'Decide whether or not to calculate multiStudent: default(False)')
-parser.add_argument('--type', default='GL', type=str, help = 'Define the loss calculation strategy: default(GL)')
+parser.add_argument('--ind', action='store_true', help = 'Decide whether or not to calculate Individual Student: default(False)')
+parser.add_argument('--avg', action='store_true', help = 'Decide whether or not to avg output as label: default(False)')
+parser.add_argument('--bpscale', action='store_true', help = 'Decide whether or not to scale the gradients: default(False)')
 parser.add_argument('--lambda_ensemble', default=0.5, type=float, help = 'Weight for ensemble_logit in teacher signal fusion: default(0.5)')
-parser.add_argument('--dissimilarity_metric', default='wasserstein1', type=str, 
-                    choices=['wasserstein1', 'wasserstein2', 'euclidean', 'kl', 'cosine'],
-                    help = 'Dissimilarity metric for adaptive weighting: wasserstein1(default), wasserstein2, euclidean, kl, cosine')
-parser.add_argument('--tau', default=1.0, type=float, help = 'Temperature for softmax normalization in dissimilarity weighting: default(1.0)')
+parser.add_argument('--tau', default=1.0, type=float, help = 'Temperature hyperparameter for softmax normalization in dissimilarity weighting: default(1.0)')
+parser.add_argument('--use_wandb', action='store_true', help = 'Use Weights & Biases for logging: default(False)')
+parser.add_argument('--wandb_project', default='PHR', type=str, help = 'W&B project name: default(PHR)')
+parser.add_argument('--wandb_entity', default='swufe1hh-cstc', type=str, help = 'W&B entity (username or team): default(swufe1hh-cstc)')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -90,8 +93,8 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
     model.train()
 
     # set running average object for loss and accuracy
-    accTop1_avg = list(range(args.num_branches + 1))
-    accTop5_avg = list(range(args.num_branches + 1))
+    accTop1_avg = list(range(args.num_branches+1))
+    accTop5_avg = list(range(args.num_branches+1))
     for i in range(args.num_branches + 1):
         accTop1_avg[i] = utils.RunningAverage()
         accTop5_avg[i] = utils.RunningAverage()
@@ -102,70 +105,67 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
     
     # Use tqdm for progress bar
     with tqdm(total=len(train_loader)) as t:
-        for batch_idx, (train_batch, labels_batch, sample_ids) in enumerate(train_loader):
+        for i, (train_batch, labels_batch, sample_ids) in enumerate(train_loader):
             train_batch = train_batch.cuda(non_blocking=True)
             labels_batch = labels_batch.cuda(non_blocking=True)
             sample_ids = sample_ids.cuda(non_blocking=True)
             
             # compute model output and loss
             model_output = model(train_batch, sample_ids=sample_ids)
-            
-            # 处理不同的返回值情况
-            if len(model_output) == 4:
-                output_batch, x_m, x_stu, ensemble_logit = model_output
+            if len(model_output) == 3:
+                output_batch, x_m, ensemble_logit = model_output
                 use_ensemble = True
                 record_epoch_logits(model, sample_ids, ensemble_logit)
             else:
-                output_batch, x_m, x_stu = model_output 
-                use_ensemble = False
-            
-            # 计算简单平均作为基础教师信号
-            mean_logit = torch.mean(output_batch, dim=2)  # [batch_size, num_classes]
-            
+                output_batch, x_m = model_output
+                ensemble_logit = None
+                use_ensemble = False 
             loss_true = 0
             loss_group = 0    
-            for i in range(args.num_branches - 1):
-                loss_true += criterion(output_batch[:,:,i], labels_batch)
-                
-                # 第一个蒸馏损失：融合 ensemble_logit 和 x_m
-                if use_ensemble:
-                    # teacher_signal = lambda * ensemble_logit + (1-lambda) * x_m[:,:,i]
-                    teacher_signal = args.lambda_ensemble * ensemble_logit + (1 - args.lambda_ensemble) * x_m[:,:,i]
-                else:
-                    # 不使用 ensemble 时，只使用注意力加权
-                    teacher_signal = x_m[:,:,i]
-                
-                loss_group += criterion_T(output_batch[:,:,i], teacher_signal)
-            
-            # 第二个蒸馏损失：领导分支学习融合的教师信号（ensemble_logit + mean_logit）
-            if use_ensemble:
-                # student_teacher_signal = lambda * ensemble_logit + (1-lambda) * mean_logit
-                student_teacher_signal = args.lambda_ensemble * ensemble_logit + (1 - args.lambda_ensemble) * mean_logit
+            if args.ind:
+                for i in range(args.num_branches):
+                    loss_true += criterion(output_batch[:,:,i], labels_batch)
+                loss_group += torch.zeros(1).cuda()
             else:
-                # 不使用 ensemble 时，只使用简单平均
-                student_teacher_signal = mean_logit
+                if args.avg:
+                    for i in range(args.num_branches):
+                        loss_true += criterion(output_batch[:,:,i], labels_batch)
+                        # 融合 ensemble_logit 和 x_m
+                        if use_ensemble:
+                            teacher_signal = args.lambda_ensemble * ensemble_logit + (1 - args.lambda_ensemble) * x_m[:,:,i]
+                        else:
+                            teacher_signal = x_m[:,:,i]
+                        loss_group += criterion_T(output_batch[:,:,i], teacher_signal)
+                else:
+                    for i in range(args.num_branches):
+                        loss_true += criterion(output_batch[:,:,i], labels_batch)
+                        # 融合 ensemble_logit 和 x_m
+                        if use_ensemble:
+                            teacher_signal = args.lambda_ensemble * ensemble_logit + (1 - args.lambda_ensemble) * x_m
+                        else:
+                            teacher_signal = x_m
+                        loss_group += criterion_T(output_batch[:,:,i], teacher_signal)
+                    
+                    # x_m 也需要学习真实标签（如果使用ensemble，则使用融合的信号）
+                    if use_ensemble:
+                        loss_true += criterion(ensemble_logit, labels_batch)
+                    else:
+                        loss_true += criterion(x_m, labels_batch)
             
-            student_distill_loss = criterion_T(x_stu, student_teacher_signal)
-            
-            loss = loss_true + criterion(x_stu, labels_batch) + args.alpha * consistency_weight * (loss_group + student_distill_loss)
+            loss = loss_true + args.alpha * consistency_weight * loss_group
         
             loss_true_avg.update(loss_true.item())
             loss_group_avg.update(loss_group.item())
             loss_avg.update(loss.item())
             
             # Update average loss and accuracy
-            for i in range(args.num_branches - 1):
+            for i in range(args.num_branches):
                 metrics = accuracy(output_batch[:,:,i], labels_batch, topk=(1,5))
                 accTop1_avg[i].update(metrics[0].item())
                 accTop5_avg[i].update(metrics[1].item())
                 # when num_branches = 4 
                 # 0,1,2 peer branches
-                
-            metrics = accuracy(x_stu, labels_batch, topk=(1,5))
-            accTop1_avg[args.num_branches - 1].update(metrics[0].item())
-            accTop5_avg[args.num_branches - 1].update(metrics[1].item())
-            # 3 leader branches
-        
+            
             e_metrics = accuracy(torch.mean(output_batch, dim=2), labels_batch, topk=(1,5)) # need to test after softmax
             accTop1_avg[args.num_branches].update(e_metrics[0].item())
             accTop5_avg[args.num_branches].update(e_metrics[1].item())            
@@ -182,11 +182,11 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
             
     mean_train_accTop1 = 0
     mean_train_accTop5 = 0
-    for i in range(args.num_branches - 1):
+    for i in range(args.num_branches):
         mean_train_accTop1 += accTop1_avg[i].value()
         mean_train_accTop5 += accTop5_avg[i].value()
-    mean_train_accTop1 /= (args.num_branches-1)
-    mean_train_accTop5 /= (args.num_branches-1)
+    mean_train_accTop1 /= (args.num_branches)
+    mean_train_accTop5 /= (args.num_branches)
     
     # compute mean of all metrics in summary     
     
@@ -195,16 +195,10 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
                      'train_group_loss': loss_group_avg.value(),
                      'mean_train_accTop1': mean_train_accTop1,
                      'mean_train_accTop5': mean_train_accTop1,
-                     'stu_train_accTop1': accTop1_avg[args.num_branches - 1].value(),
-                     'stu_train_accTop5': accTop5_avg[args.num_branches - 1].value(),
                      'train_accTop1': accTop1_avg[args.num_branches].value(),
                      'train_accTop5': accTop5_avg[args.num_branches].value(),
                      'time': time.time() - end}
-                     
-    for i in range(args.num_branches - 1):
-        train_metrics.update({'stu'+str(i)+'train_accTop1' : accTop1_avg[i].value()})
-        train_metrics.update({'stu'+str(i)+'train_accTop5' : accTop5_avg[i].value()})
-        
+   
     metrics_string = " ; ".join("{}: {:05.3f}".format(k, v) for k, v in train_metrics.items())
     logging.info("- Train metrics: " + metrics_string)
     return train_metrics
@@ -234,62 +228,59 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, consist
             labels_batch = labels_batch.cuda(non_blocking=True)
             
             # compute model output and loss
-            loss_true = 0
-            loss_group = 0
-    
             # Validation must not read from or write to the training history.
             model_output = model(test_batch, sample_ids=None)
-            
-            # 处理不同的返回值情况
-            if len(model_output) == 4:
-                output_batch, x_m, x_stu, ensemble_logit = model_output
+            if len(model_output) == 3:
+                output_batch, x_m, ensemble_logit = model_output
                 use_ensemble = True
             else:
-                output_batch, x_m, x_stu = model_output
+                output_batch, x_m = model_output
+                ensemble_logit = None
                 use_ensemble = False
-            
-            # 计算简单平均作为基础教师信号
-            mean_logit = torch.mean(output_batch, dim=2)  # [batch_size, num_classes]
-            
-            for i in range(args.num_branches - 1):
-                loss_true += criterion(output_batch[:,:,i], labels_batch)
-                
-                # 第一个蒸馏损失：融合 ensemble_logit 和 x_m
-                if use_ensemble:
-                    # teacher_signal = lambda * ensemble_logit + (1-lambda) * x_m[:,:,i]
-                    teacher_signal = args.lambda_ensemble * ensemble_logit + (1 - args.lambda_ensemble) * x_m[:,:,i]
-                else:
-                    # 不使用 ensemble 时，只使用注意力加权
-                    teacher_signal = x_m[:,:,i]
-                
-                loss_group += criterion_T(output_batch[:,:,i], teacher_signal)
-            
-            # 第二个蒸馏损失：领导分支学习融合的教师信号（ensemble_logit + mean_logit）
-            if use_ensemble:
-                # student_teacher_signal = lambda * ensemble_logit + (1-lambda) * mean_logit
-                student_teacher_signal = args.lambda_ensemble * ensemble_logit + (1 - args.lambda_ensemble) * mean_logit
+            loss_true = 0 
+            loss_group = 0
+            if args.ind:
+                for i in range(args.num_branches):
+                    loss_true += criterion(output_batch[:,:,i], labels_batch)
+                loss_group += torch.zeros(1).cuda()
             else:
-                # 不使用 ensemble 时，只使用简单平均
-                student_teacher_signal = mean_logit
+                if args.avg:
+                    for i in range(args.num_branches):
+                        loss_true += criterion(output_batch[:,:,i], labels_batch)
+                        # 融合 ensemble_logit 和 x_m
+                        if use_ensemble:
+                            teacher_signal = args.lambda_ensemble * ensemble_logit + (1 - args.lambda_ensemble) * x_m[:,:,i]
+                        else:
+                            teacher_signal = x_m[:,:,i]
+                        loss_group += criterion_T(output_batch[:,:,i], teacher_signal)
+                else:            
+                    for i in range(args.num_branches):
+                        loss_true += criterion(output_batch[:,:,i], labels_batch)
+                        # 融合 ensemble_logit 和 x_m
+                        if use_ensemble:
+                            teacher_signal = args.lambda_ensemble * ensemble_logit + (1 - args.lambda_ensemble) * x_m
+                        else:
+                            teacher_signal = x_m
+                        loss_group += criterion_T(output_batch[:,:,i], teacher_signal)
+                    
+                    # x_m 也需要学习真实标签（如果使用ensemble，则使用融合的信号）
+                    if use_ensemble:
+                        loss_true += criterion(ensemble_logit, labels_batch)
+                    else:
+                        loss_true += criterion(x_m, labels_batch)
+                
+            loss = loss_true + args.alpha * consistency_weight * loss_group
             
-            student_distill_loss = criterion_T(x_stu, student_teacher_signal)
-            
-            loss = loss_true + criterion(x_stu, labels_batch) + args.alpha * consistency_weight * (loss_group + student_distill_loss)
-    
             loss_true_avg.update(loss_true.item())
             loss_group_avg.update(loss_group.item())
             loss_avg.update(loss.item())
             
             # Update average loss and accuracy
-            for i in range(args.num_branches - 1):
+            for i in range(args.num_branches):
                 metrics = accuracy(output_batch[:,:,i], labels_batch, topk=(1,5))
                 accTop1_avg[i].update(metrics[0].item())
                 accTop5_avg[i].update(metrics[1].item())
-                                
-            metrics = accuracy(x_stu, labels_batch, topk=(1,5))
-            accTop1_avg[args.num_branches - 1].update(metrics[0].item())
-            accTop5_avg[args.num_branches - 1].update(metrics[1].item())
-                
+            
             e_metrics = accuracy(torch.mean(output_batch, dim=2), labels_batch, topk=(1,5))
             accTop1_avg[args.num_branches].update(e_metrics[0].item())
             accTop5_avg[args.num_branches].update(e_metrics[1].item()) 
@@ -298,22 +289,23 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, consist
             output_batch = F.softmax(output_batch, dim=1)    
             for kk in range(len_kk):
                 ret = output_batch[kk,:,:]
-                # ret = ret.squeeze(0)           
+#                 ret = ret.squeeze(0)           
                 ret = ret.t()                  # branches x classes
                 sim = 0
                 for j in range(args.num_branches-1):
                     for k in range(j+1, args.num_branches-1):
                         sim += pdist(ret[j:j+1,:],ret[k:k+1,:])    
+                #sim = 2 * sim / (num_branches*(num_branches-1))
                 sim = sim / 3
                 dist_avg.update(sim.item())
 
     mean_test_accTop1 = 0
     mean_test_accTop5 = 0
-    for i in range(args.num_branches - 1):
+    for i in range(args.num_branches):
         mean_test_accTop1 += accTop1_avg[i].value()
         mean_test_accTop5 += accTop5_avg[i].value()
-    mean_test_accTop1 /= (args.num_branches - 1)
-    mean_test_accTop5 /= (args.num_branches - 1)
+    mean_test_accTop1 /= (args.num_branches)
+    mean_test_accTop5 /= (args.num_branches)
     # compute mean of all metrics in summary
         
     test_metrics = { 'test_loss': loss_avg.value(),
@@ -323,13 +315,8 @@ def evaluate(test_loader, model, criterion, criterion_T, accuracy, args, consist
                      'mean_test_accTop5': mean_test_accTop5,
                      'test_accTop1': accTop1_avg[args.num_branches].value(),
                      'test_accTop5': accTop5_avg[args.num_branches].value(),
-                     'stu_test_accTop1': accTop1_avg[args.num_branches - 1].value(),
-                     'stu_test_accTop5': accTop5_avg[args.num_branches - 1].value(),
                      'dist': dist_avg.value(),
                      'time': time.time() - end}
-    for i in range(args.num_branches - 1):
-        test_metrics.update({'stu'+str(i)+'test_accTop1' : accTop1_avg[i].value()})
-        test_metrics.update({'stu'+str(i)+'test_accTop5' : accTop5_avg[i].value()})
     
     metrics_string = " ; ".join("{}: {:05.3f}".format(k, v) for k, v in test_metrics.items())
     logging.info("- Test metrics: " + metrics_string)
@@ -345,7 +332,6 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
     
     # TensorboardX setup
     writer = SummaryWriter(log_dir = model_dir) # ensemble
-    writerB = SummaryWriter(log_dir = os.path.join(model_dir, 'B')) # ensemble
     
     # Save best ensemble or average accTop1
     choose_E = False
@@ -370,7 +356,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         if choose_E:
             best_acc = checkpoint['test_accTop1']
         else:
-            best_acc = checkpoint['stu_test_accTop1']
+            best_acc = checkpoint['mean_test_accTop1']
         result_train_metrics = torch.load(os.path.join(args.resume, 'train_metrics'))
         result_test_metrics = torch.load(os.path.join(args.resume, 'test_metrics'))
         
@@ -392,14 +378,21 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         train_metrics = train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args, consistency_weight)
 		
         writer.add_scalar('Train/Loss', train_metrics['train_loss'], epoch+1)
-        writer.add_scalar('Train/Loss_True', train_metrics['train_true_loss'], epoch+1)
-        writer.add_scalar('Train/Loss_Group', train_metrics['train_group_loss'], epoch+1)
         writer.add_scalar('Train/AccTop1', train_metrics['train_accTop1'], epoch+1)
-        writerB.add_scalar('Train/AccTop1', train_metrics['stu_train_accTop1'], epoch+1)
-        writerB.add_scalar('Train/AccTop1_B0', train_metrics['stu0train_accTop1'], epoch+1)
-        writerB.add_scalar('Train/AccTop1_B1', train_metrics['stu1train_accTop1'], epoch+1)
-        writerB.add_scalar('Train/AccTop1_B2', train_metrics['stu2train_accTop1'], epoch+1)
-    
+        
+        # Log to wandb
+        if args.use_wandb:
+            wandb.log({
+                'epoch': epoch + 1,
+                'train/loss': train_metrics['train_loss'],
+                'train/loss_true': train_metrics['train_true_loss'],
+                'train/loss_group': train_metrics['train_group_loss'],
+                'train/acc_top1_ensemble': train_metrics['train_accTop1'],
+                'train/acc_top1_mean': train_metrics['mean_train_accTop1'],
+                'train/consistency_weight': consistency_weight,
+                'train/learning_rate': optimizer.param_groups[0]['lr'],
+            }, step=epoch+1)
+        
         # Evaluate for one epoch on validation set
         test_metrics = evaluate(test_loader, model, criterion, criterion_T, accuracy, args, consistency_weight) 
         
@@ -416,16 +409,21 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         if choose_E:
             test_acc = test_metrics['test_accTop1']
         else:
-            test_acc = test_metrics['stu_test_accTop1']
+            test_acc = test_metrics['mean_test_accTop1']
             
         writer.add_scalar('Test/Loss', test_metrics['test_loss'], epoch+1)
-        writer.add_scalar('Test/Loss_True', test_metrics['test_true_loss'], epoch+1)
-        writer.add_scalar('Test/Loss_Group', test_metrics['test_group_loss'], epoch+1)
         writer.add_scalar('Test/AccTop1', test_metrics['test_accTop1'], epoch+1)
-        writerB.add_scalar('Test/AccTop1', test_metrics['stu_test_accTop1'], epoch+1)
-        writerB.add_scalar('Test/AccTop1_B0', test_metrics['stu0test_accTop1'], epoch+1)
-        writerB.add_scalar('Test/AccTop1_B1', test_metrics['stu1test_accTop1'], epoch+1)
-        writerB.add_scalar('Test/AccTop1_B2', test_metrics['stu2test_accTop1'], epoch+1)
+        
+        # Log to wandb
+        if args.use_wandb:
+            wandb.log({
+                'test/loss': test_metrics['test_loss'],
+                'test/loss_true': test_metrics['test_true_loss'],
+                'test/loss_group': test_metrics['test_group_loss'],
+                'test/acc_top1_ensemble': test_metrics['test_accTop1'],
+                'test/acc_top1_mean': test_metrics['mean_test_accTop1'],
+                'test/diversity': test_metrics['dist'],
+            }, step=epoch+1)
         
         result_train_metrics[epoch] = train_metrics
         result_test_metrics[epoch] = test_metrics
@@ -440,8 +438,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
                         'epoch': epoch + 1,
                         'optim_dict': optimizer.state_dict(),
                         'test_accTop1': test_metrics['test_accTop1'],
-                        'mean_test_accTop1': test_metrics['mean_test_accTop1'],
-                        'stu_test_accTop1': test_metrics['stu_test_accTop1']}, last_path)
+                        'mean_test_accTop1': test_metrics['mean_test_accTop1']}, last_path)
         # If best_eval, best_save_path
         is_best = test_acc >= best_acc
         if is_best:
@@ -449,12 +446,13 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
             best_acc = test_acc            
             # Save best metrics in a json file in the model directory (添加模型名、时间戳和数据集名称)
             test_metrics['epoch'] = epoch + 1
-            best_metrics_filename = f"test_best_metrics_ensem_{args.gpu_id}_{args.lambda_ensemble}_tau1.5_{args.model}_{args.dataset}_{timestamp}.json"
+            best_metrics_filename = f"test_best_metrics_one_{args.gpu_id}_{args.lambda_ensemble}_seed97div_{args.model}_{args.dataset}_{timestamp}.json"
             utils.save_dict_to_json(test_metrics, os.path.join(model_dir, best_metrics_filename))
         
             # Save model and optimizer
             shutil.copyfile(last_path, os.path.join(model_dir, 'best.pth'))
     writer.close()   
+    
 def get_current_consistency_weight(current, rampup_length = args.length):
     # Consistency ramp-up from https://arxiv.org/abs/1610.02242
     if rampup_length == 0:
@@ -473,17 +471,29 @@ if __name__ == '__main__':
     
     # Set the model directory    
     if args.MulStu:
-        model_dir= os.path.join('.', args.dataset, str(args.num_epochs), args.type, args.model + 'M' + str(args.num_branches) + 'T' + str(args.temperature) + 'S' + str(args.loss) + args.version)
+        model_dir= os.path.join('.', args.dataset, str(args.num_epochs), 'one', args.model + 'M' + str(args.num_branches) + 'T' + str(args.temperature) + 'S' + str(args.loss) + args.version)
     else:
-        model_dir= os.path.join('.', args.dataset, str(args.num_epochs), args.type, args.model + 'B' + str(args.num_branches) + 'T' + str(args.temperature) + 'S' + str(args.loss) + args.version)
+        model_dir= os.path.join('.', args.dataset, str(args.num_epochs), 'one', args.model + 'B' + str(args.num_branches) + 'T' + str(args.temperature) + 'I' + str(args.ind) + 'avg' + str(args.avg) + 'bpscale' + str(args.bpscale) + args.version)
     
     if not os.path.exists(model_dir):
         print("Directory does not exist! Making directory {}".format(model_dir))
         os.makedirs(model_dir)
     
     # Set the logger (添加模型名、时间戳和数据集名称)
-    log_filename = f'train_{args.model}_{args.dataset}_{args.gpu_id}_{args.lambda_ensemble}_{timestamp}.log'
+    log_filename = f'train_one_{args.model}_{args.dataset}_{args.gpu_id}_{args.lambda_ensemble}_{timestamp}.log'
     utils.set_logger(os.path.join(model_dir, log_filename))
+    
+    # Initialize Weights & Biases
+    if args.use_wandb:
+        run_name = f"ONE_{args.model}_{args.dataset}_b{args.num_branches}_lambda{args.lambda_ensemble}_{timestamp}"
+        wandb.init(
+            project=args.wandb_project,
+            entity=args.wandb_entity,
+            name=run_name,
+            config=vars(args),
+            dir=model_dir,
+        )
+        logging.info(f"- Initialized W&B: project={args.wandb_project}, run={run_name}")
 
     # Create the input data pipeline
     logging.info("Loading the datasets...")
@@ -512,31 +522,24 @@ if __name__ == '__main__':
     
     # Training from scratch
     model_fd = getattr(models, model_folder)
+    
+    # Network-based
     if args.MulStu:
         model_cfg = getattr(model_fd, 'MultiNet')
         model = getattr(model_cfg, 'StuNet')(model = args.model, num_branches = args.num_branches, num_classes = num_classes, input_channel=utils.lookup(args.model), dropout = args.dropout)
-    elif args.type == 'DML':
-        model_cfg = getattr(model_fd, 'DML')
-        model = getattr(model_cfg, 'MutualNet')(model = args.model, num_branches = args.num_branches, num_classes = num_classes)
+    # Branch-based
     else:
         if "resnet" in args.model:
-            model_cfg = getattr(model_fd, 'resnet_GL')
-            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches, 
-                                                   input_channel=utils.lookup(args.model), 
-                                                   dissimilarity_metric=args.dissimilarity_metric,
-                                                   tau=args.tau)
+            model_cfg = getattr(model_fd, 'resnet_one')
+            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches, ind=args.ind, avg=args.avg, bpscale=args.bpscale, tau=args.tau)
         elif "vgg" in args.model:
-            model_cfg = getattr(model_fd, 'vgg_GL')
-            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches,
-                                                   dissimilarity_metric=args.dissimilarity_metric,
-                                                   tau=args.tau)
+            model_cfg = getattr(model_fd, 'vgg_one')
+            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches, ind=args.ind, avg=args.avg, bpscale=args.bpscale, tau=args.tau)
         elif "densenet" in args.model:
-            model_cfg = getattr(model_fd, 'densenet_GL')
-            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches,
-                                                   dissimilarity_metric=args.dissimilarity_metric,
-                                                   tau=args.tau)
+            model_cfg = getattr(model_fd, 'densenet_one')
+            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches, ind=args.ind, avg=args.avg, bpscale=args.bpscale, tau=args.tau)
         
-        
+    
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model, device_ids=[0,1,2,3]).to(device)
     else:
@@ -563,3 +566,8 @@ if __name__ == '__main__':
     state['Total params'] = num_params
     params_json_path = os.path.join(model_dir, "parameters.json") # save parameters
     utils.save_dict_to_json(state, params_json_path)
+    
+    # Finish W&B run
+    if args.use_wandb:
+        wandb.finish()
+        logging.info("- W&B run finished")

@@ -63,10 +63,6 @@ parser.add_argument('--length', default=80, type=float, help='length ratio: defa
 parser.add_argument('--MulStu', action='store_true', help = 'Decide whether or not to calculate multiStudent: default(False)')
 parser.add_argument('--type', default='GL', type=str, help = 'Define the loss calculation strategy: default(GL)')
 parser.add_argument('--lambda_ensemble', default=0.5, type=float, help = 'Weight for ensemble_logit in teacher signal fusion: default(0.5)')
-parser.add_argument('--dissimilarity_metric', default='wasserstein1', type=str, 
-                    choices=['wasserstein1', 'wasserstein2', 'euclidean', 'kl', 'cosine'],
-                    help = 'Dissimilarity metric for adaptive weighting: wasserstein1(default), wasserstein2, euclidean, kl, cosine')
-parser.add_argument('--tau', default=1.0, type=float, help = 'Temperature for softmax normalization in dissimilarity weighting: default(1.0)')
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -449,7 +445,7 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
             best_acc = test_acc            
             # Save best metrics in a json file in the model directory (添加模型名、时间戳和数据集名称)
             test_metrics['epoch'] = epoch + 1
-            best_metrics_filename = f"test_best_metrics_ensem_{args.gpu_id}_{args.lambda_ensemble}_tau1.5_{args.model}_{args.dataset}_{timestamp}.json"
+            best_metrics_filename = f"test_best_metrics_ensem_{args.gpu_id}_{args.lambda_ensemble}_seed97div_{args.model}_{args.dataset}_{timestamp}.json"
             utils.save_dict_to_json(test_metrics, os.path.join(model_dir, best_metrics_filename))
         
             # Save model and optimizer
@@ -521,20 +517,13 @@ if __name__ == '__main__':
     else:
         if "resnet" in args.model:
             model_cfg = getattr(model_fd, 'resnet_GL')
-            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches, 
-                                                   input_channel=utils.lookup(args.model), 
-                                                   dissimilarity_metric=args.dissimilarity_metric,
-                                                   tau=args.tau)
+            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches, input_channel=utils.lookup(args.model))
         elif "vgg" in args.model:
             model_cfg = getattr(model_fd, 'vgg_GL')
-            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches,
-                                                   dissimilarity_metric=args.dissimilarity_metric,
-                                                   tau=args.tau)
+            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches)
         elif "densenet" in args.model:
             model_cfg = getattr(model_fd, 'densenet_GL')
-            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches,
-                                                   dissimilarity_metric=args.dissimilarity_metric,
-                                                   tau=args.tau)
+            model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches)
         
         
     if torch.cuda.device_count() > 1:

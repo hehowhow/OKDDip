@@ -38,7 +38,22 @@ import torch
 import torchvision
 import torchvision.transforms as transforms
 
-def dataloader(data_name= "CIFAR100", batch_size= 64, num_workers = 8, root = './Data'):
+class IndexedDataset(torch.utils.data.Dataset):
+    """Add the stable underlying dataset index to every returned sample."""
+
+    def __init__(self, dataset):
+        self.dataset = dataset
+
+    def __getitem__(self, index):
+        sample = self.dataset[index]
+        return sample + (index,)
+
+    def __len__(self):
+        return len(self.dataset)
+
+
+def dataloader(data_name= "CIFAR100", batch_size= 64, num_workers = 8,
+               root = './Data', return_indices=False):
     """
     Fetch and return train/test dataloader.
     """
@@ -104,6 +119,10 @@ def dataloader(data_name= "CIFAR100", batch_size= 64, num_workers = 8, root = '.
         # trainset = torchvision.datasets.ImageNet(root=root, split='train', download=False, transform=train_transformer)
         # testset = torchvision.datasets.ImageNet(root=root, split='val', download=False, transform=test_transformer)
         
+    if return_indices:
+        trainset = IndexedDataset(trainset)
+        testset = IndexedDataset(testset)
+
     trainloader = torch.utils.data.DataLoader(trainset, shuffle = True, **kwargs)
     
     testloader = torch.utils.data.DataLoader(testset, shuffle = False, **kwargs)

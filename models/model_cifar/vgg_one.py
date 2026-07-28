@@ -11,6 +11,7 @@ Reference:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ..logit_history import load_history_batch, record_history_batch
 
 __all__ = ['vgg16', 'vgg19']
 
@@ -33,12 +34,13 @@ class ILR(torch.autograd.Function):
 
 
 class VGG(nn.Module):
-    def __init__(self, num_classes=10, num_branches=3, bpscale = False, avg = False, ind = False, depth=16):
+    def __init__(self, num_classes=10, num_branches=3, bpscale = False, avg = False, ind = False, depth=16, tau=1.0):
         super(VGG, self).__init__()
         self.inplances = 64
         self.avg = avg
         self.bpscale = bpscale
         self.num_branches = num_branches
+        self.tau = tau  # 温度超参数
         self.conv1 = nn.Conv2d(3, self.inplances, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(self.inplances)
         self.conv2 = nn.Conv2d(self.inplances, self.inplances, kernel_size=3, padding=1)
@@ -72,6 +74,13 @@ class VGG(nn.Module):
             self.bn_v1 = nn.BatchNorm1d(self.num_branches)
         if self.bpscale:
             self.layer_ILR = ILR.apply
+        
+        # 自适应加权模块的状态追踪
+        self.use_adaptive_weighting = True  # 是否启用自适应加权
+        self.epoch_count = 0  # 当前epoch计数（从0开始）
+        self.prev_ensem_logits = {}  # 字典：{sample_id: tensor}，存储每个样本上一轮的ensemble logit
+        self.current_epoch_ensem_logits = {}  # 字典：存储当前epoch内的ensemble logit
+        
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
@@ -93,7 +102,62 @@ class VGG(nn.Module):
         layers += [nn.MaxPool2d(kernel_size=2, stride=2)]
         return nn.Sequential(*layers)
     
-    def forward(self, x):
+    def compute_wasserstein_dissimilarities(self, logitlist, sample_ids=None):
+        """
+        计算各分支logit与历史ensemble logit的一阶Wasserstein距离（样本级别）- 优化版本
+        """
+        # 第一个epoch：返回均匀权重
+        if self.epoch_count == 0 or sample_ids is None or len(self.prev_ensem_logits) == 0:
+            batch_size = logitlist[0].size(0)
+            num_branches = len(logitlist)
+            uniform_weight = 1.0 / num_branches
+            return [torch.ones(batch_size, device=logitlist[0].device) * uniform_weight for _ in range(num_branches)]
+        
+        batch_size = logitlist[0].size(0)
+        device = logitlist[0].device
+        num_branches = len(logitlist)
+        num_classes = logitlist[0].size(1)
+        
+        # 优化1: 批量收集历史logits到GPU tensor
+        prev_logits_batch, valid_mask = load_history_batch(
+            self.prev_ensem_logits,
+            sample_ids,
+            batch_size,
+            num_classes,
+            device,
+        )
+        
+        # 优化2: 向量化计算所有分支的Wasserstein距离
+        current_logits_stacked = torch.stack(logitlist, dim=0)
+        current_probs = F.softmax(current_logits_stacked, dim=2)
+        prev_probs = F.softmax(prev_logits_batch.unsqueeze(0), dim=2)
+        current_cdfs = torch.cumsum(current_probs, dim=2)
+        prev_cdfs = torch.cumsum(prev_probs, dim=2)
+        wasserstein_dists = torch.sum(torch.abs(current_cdfs - prev_cdfs), dim=2)
+        wasserstein_dists[:, ~valid_mask] = 1.0
+        
+        # 优化3: 基于softmax的归一化（使用温度参数tau）
+        dissim_matrix = wasserstein_dists.transpose(0, 1)
+        
+        # 使用softmax进行归一化：w_m = exp(d_m/tau) / sum(exp(d_j/tau))
+        # tau越小，分布越尖锐（更重视最不同的分支）
+        normalized_dissim = F.softmax(dissim_matrix / self.tau, dim=1)
+        
+        return [normalized_dissim[:, i] for i in range(num_branches)]
+    
+    def update_epoch_history(self):
+        """在每个epoch结束时调用，更新历史记录"""
+        self.prev_ensem_logits = self.current_epoch_ensem_logits.copy()
+        self.current_epoch_ensem_logits = {}
+        self.epoch_count += 1
+
+    def record_epoch_logits(self, sample_ids, ensemble_logits):
+        """Record gathered training logits under stable dataset indices."""
+        record_history_batch(
+            self.current_epoch_ensem_logits, sample_ids, ensemble_logits
+        )
+    
+    def forward(self, x, sample_ids=None):
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -155,8 +219,21 @@ class VGG(nn.Module):
                     x_m += x_c[:,i].view(-1, 1).repeat(1, temp_1.size(1)) * temp_1       # B x num_classes
                     temp_1 = temp_1.unsqueeze(-1)
                     pro = torch.cat([pro,temp_1],-1)        # B x num_classes x num_branches
-              
-            return pro, x_m
+            
+            # 自适应加权逻辑
+            if self.use_adaptive_weighting:
+                # 提取各分支的logits
+                logitlist = [pro[:, :, i] for i in range(self.num_branches)]
+                
+                # 计算自适应权重（基于与历史ensemble的相异度）
+                adaptive_weights = self.compute_wasserstein_dissimilarities(logitlist, sample_ids)
+                
+                # 计算加权ensemble logit
+                ensemble_logit = sum(w.unsqueeze(1) * logit for w, logit in zip(adaptive_weights, logitlist))
+                
+                return pro, x_m, ensemble_logit
+            else:
+                return pro, x_m
     
 def vgg16(pretrained=False, path=None, **kwargs):
     """

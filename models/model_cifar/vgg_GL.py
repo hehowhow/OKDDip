@@ -9,6 +9,7 @@ Reference:
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ..logit_history import load_history_batch, record_history_batch
 __all__ = ['vgg16', 'vgg19']
 
 #cfg = {
@@ -55,7 +56,7 @@ class VGG(nn.Module):
         self.key_weight = nn.Linear(input_channel, input_channel//factor, bias = False)
         
         # 自适应加权模块的状态追踪
-        self.use_adaptive_weighting = True  # 是否启用自适应加权
+        self.use_adaptive_weighting = False  # 是否启用自适应加权
         self.epoch_count = 0  # 当前epoch计数（从0开始）
         self.prev_ensem_logits = {}  # 字典：{sample_id: tensor}，存储每个样本上一轮的ensemble logit
         self.current_epoch_ensem_logits = {}  # 字典：存储当前epoch内的ensemble logit
@@ -105,13 +106,13 @@ class VGG(nn.Module):
         num_classes = logitlist[0].size(1)
         
         # 优化1: 批量收集历史logits到GPU tensor
-        prev_logits_batch = torch.zeros(batch_size, num_classes, device=device)
-        valid_mask = torch.zeros(batch_size, dtype=torch.bool, device=device)
-        
-        for i, sample_id in enumerate(sample_ids):
-            if sample_id in self.prev_ensem_logits:
-                prev_logits_batch[i] = self.prev_ensem_logits[sample_id]
-                valid_mask[i] = True
+        prev_logits_batch, valid_mask = load_history_batch(
+            self.prev_ensem_logits,
+            sample_ids,
+            batch_size,
+            num_classes,
+            device,
+        )
         
         # 优化2: 向量化计算所有分支的Wasserstein距离
         # 堆叠所有分支的logits: [num_branches, batch_size, num_classes]
@@ -152,14 +153,14 @@ class VGG(nn.Module):
         self.current_epoch_ensem_logits = {}
         # 更新epoch计数
         self.epoch_count += 1
+
+    def record_epoch_logits(self, sample_ids, ensemble_logits):
+        """Record gathered training logits under stable dataset indices."""
+        record_history_batch(
+            self.current_epoch_ensem_logits, sample_ids, ensemble_logits
+        )
     
     def forward(self, x, sample_ids=None):
-        # 生成sample_ids（如果未提供）
-        if sample_ids is None:
-            batch_size = x.size(0)
-            # 使用batch内的索引作为临时ID（训练时会被覆盖）
-            sample_ids = list(range(batch_size))
-    
         x = self.conv1(x)
         x = self.bn1(x)
         x = self.relu(x)
@@ -216,10 +217,6 @@ class VGG(nn.Module):
                     weighted_logit = logit * weight.view(-1, 1)  # [batch_size, num_classes]
                     ensemble_logit += weighted_logit
                 
-                # 存储当前epoch的ensemble输出
-                for j, sample_id in enumerate(sample_ids):
-                    self.current_epoch_ensem_logits[sample_id] = ensemble_logit[j].detach()
-                
                 # 返回：pro包含各分支logits，ensemble_logit是自适应加权后的结果
                 return pro, x_m, ensemble_logit
             
@@ -263,10 +260,6 @@ class VGG(nn.Module):
                 for i, (logit, weight) in enumerate(zip(logitlist, dissimilarities)):
                     weighted_logit = logit * weight.view(-1, 1)  # [batch_size, num_classes]
                     ensemble_logit += weighted_logit
-                
-                # 存储当前epoch的ensemble输出
-                for j, sample_id in enumerate(sample_ids):
-                    self.current_epoch_ensem_logits[sample_id] = ensemble_logit[j].detach()
                 
                 return pro, x_m, temp_out, ensemble_logit
             

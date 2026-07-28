@@ -83,7 +83,7 @@ def test_wasserstein_computation():
     
     # 第一个epoch（没有历史）
     print("第一个epoch（没有历史记录）:")
-    dissimilarities = model.compute_wasserstein_dissimilarities(logitlist, sample_ids)
+    dissimilarities = model.compute_dissimilarities(logitlist, sample_ids)
     print(f"✓ 返回的权重数量: {len(dissimilarities)}")
     print(f"✓ 每个权重的形状: {dissimilarities[0].shape}")
     
@@ -101,7 +101,8 @@ def test_wasserstein_computation():
     for i, sid in enumerate(sample_ids):
         model.prev_ensem_logits[sid] = torch.randn(num_classes)
     
-    dissimilarities = model.compute_wasserstein_dissimilarities(logitlist, sample_ids)
+    model.epoch_count = 1
+    dissimilarities = model.compute_dissimilarities(logitlist, sample_ids)
     total_weights = sum([d[0].item() for d in dissimilarities])
     print(f"✓ 第一个样本的权重和: {total_weights:.6f}")
     print("✓ 各分支权重（第一个样本）:")
@@ -121,7 +122,7 @@ def test_epoch_history_update():
         num_branches=4,
         input_channel=64
     )
-    model.eval()
+    model.train()
     
     batch_size = 8
     x = torch.randn(batch_size, 3, 32, 32)
@@ -134,9 +135,12 @@ def test_epoch_history_update():
     # 模拟第一个epoch
     print("\n模拟Epoch 0:")
     for batch_idx in range(3):
-        sample_ids = [batch_idx * batch_size + j for j in range(batch_size)]
+        sample_ids = torch.arange(
+            batch_idx * batch_size, (batch_idx + 1) * batch_size
+        )
         with torch.no_grad():
-            _ = model(x, sample_ids=sample_ids)
+            output = model(x, sample_ids=sample_ids)
+        model.record_epoch_logits(sample_ids, output[-1])
     
     print(f"✓ 当前记录数: {len(model.current_epoch_ensem_logits)}")
     
@@ -150,9 +154,12 @@ def test_epoch_history_update():
     # 模拟第二个epoch
     print("\n模拟Epoch 1:")
     for batch_idx in range(3):
-        sample_ids = [batch_idx * batch_size + j for j in range(batch_size)]
+        sample_ids = torch.arange(
+            batch_idx * batch_size, (batch_idx + 1) * batch_size
+        )
         with torch.no_grad():
-            _ = model(x, sample_ids=sample_ids)
+            output = model(x, sample_ids=sample_ids)
+        model.record_epoch_logits(sample_ids, output[-1])
     
     print(f"✓ 当前记录数: {len(model.current_epoch_ensem_logits)}")
     
@@ -180,7 +187,7 @@ def test_adaptive_weighting_effect():
     
     batch_size = 4
     x = torch.randn(batch_size, 3, 32, 32)
-    sample_ids = list(range(batch_size))
+    sample_ids = torch.arange(batch_size)
     
     # 启用自适应加权
     model.use_adaptive_weighting = True
@@ -224,6 +231,7 @@ def test_memory_efficiency():
     
     # Forward传播
     output = model(x, sample_ids=sample_ids)
+    model.record_epoch_logits(sample_ids, output[-1])
     
     # 检查存储的历史是否正确detach
     print(f"✓ 当前epoch记录数: {len(model.current_epoch_ensem_logits)}")
@@ -312,7 +320,6 @@ if __name__ == "__main__":
     torch.manual_seed(42)
     
     run_all_tests()
-
 
 
 
