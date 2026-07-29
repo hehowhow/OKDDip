@@ -12,6 +12,7 @@ Deep Residual Learning for Image Recognition. https://arxiv.org/abs/1512.03385
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from ..batch_logit_history import compute_batch_dissimilarities
 from ..logit_history import load_history_batch, record_history_batch
 
 __all__ = ['ResNet', 'resnet32', 'resnet110', 'wide_resnet20_8']
@@ -109,7 +110,8 @@ class Bottleneck(nn.Module):
 
 class ResNet(nn.Module):
     def __init__(self, block, layers, num_classes=10, num_branches = 3, input_channel=64, factor=8, en = False, zero_init_residual=False, 
-        groups=1, width_per_group=64, replace_stride_with_dilation=None, norm_layer=None, KD = False, dissimilarity_metric='wasserstein1', tau=1.0):
+        groups=1, width_per_group=64, replace_stride_with_dilation=None, norm_layer=None, KD = False,
+        dissimilarity_metric='wasserstein1', tau=1.0, history_granularity='sample'):
         super(ResNet, self).__init__()
         if norm_layer is None:
             norm_layer = nn.BatchNorm2d
@@ -119,6 +121,11 @@ class ResNet(nn.Module):
         self.num_branches = num_branches
         self.dissimilarity_metric = dissimilarity_metric
         self.tau = tau  # 温度超参数，用于softmax归一化
+        if history_granularity not in ('sample', 'batch'):
+            raise ValueError(
+                "history_granularity must be either 'sample' or 'batch'"
+            )
+        self.history_granularity = history_granularity
         
         self.inplanes = 16
         self.dilation = 1
@@ -152,6 +159,11 @@ class ResNet(nn.Module):
         self.epoch_count = 0  # 当前epoch计数（从0开始）
         self.prev_ensem_logits = {}  # 字典：{sample_id: tensor}，存储每个样本上一轮的ensemble logit
         self.current_epoch_ensem_logits = {}  # 字典：存储当前epoch内的ensemble logit
+        # Batch-level mode keeps O(num_classes + num_branches) state only.
+        self.prev_batch_teacher_mean = None
+        self.current_epoch_batch_distance_sum = None
+        self.current_epoch_batch_distance_count = 0
+        self.batch_branch_weights = None
         
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
@@ -205,6 +217,9 @@ class ResNet(nn.Module):
             dissimilarities: list of tensors，长度等于分支数，每个tensor shape为[batch_size]
                             表示该分支每个样本的归一化相异度权重（所有分支权重和为1）
         """
+        if self.history_granularity == 'batch':
+            return self.compute_batch_level_dissimilarities(logitlist)
+
         # 第一个epoch：返回均匀权重
         if self.epoch_count == 0 or sample_ids is None or len(self.prev_ensem_logits) == 0:
             batch_size = logitlist[0].size(0)
@@ -301,11 +316,59 @@ class ResNet(nn.Module):
         
         # 转换为list格式（与原接口兼容）
         return [normalized_dissim[:, i] for i in range(num_branches)]
+
+    def compute_batch_level_dissimilarities(self, logitlist):
+        """Return one fixed branch-weight vector for the whole current epoch.
+
+        Epochs 0 and 1 use uniform weights. During epoch 1 and later, each
+        training batch compares every branch's mean student logit with the
+        immediately preceding training batch's mean teacher logit. Distances
+        are averaged over the epoch and converted into the weights used by the
+        next epoch.
+        """
+        batch_size = logitlist[0].size(0)
+        device = logitlist[0].device
+        dtype = logitlist[0].dtype
+        num_branches = len(logitlist)
+
+        if self.epoch_count < 2 or self.batch_branch_weights is None:
+            weights = torch.full(
+                (num_branches,),
+                1.0 / num_branches,
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            weights = self.batch_branch_weights.to(device=device, dtype=dtype)
+            if weights.numel() != num_branches:
+                raise RuntimeError(
+                    "Stored batch branch weights do not match model branches"
+                )
+
+        return [
+            weights[i].expand(batch_size)
+            for i in range(num_branches)
+        ]
     
     def update_epoch_history(self):
         """
         在每个epoch结束时调用，更新历史记录
         """
+        if self.history_granularity == 'batch':
+            if (self.epoch_count >= 1
+                    and self.current_epoch_batch_distance_count > 0):
+                mean_distances = (
+                    self.current_epoch_batch_distance_sum
+                    / self.current_epoch_batch_distance_count
+                )
+                self.batch_branch_weights = F.softmax(
+                    mean_distances / self.tau, dim=0
+                ).detach()
+            self.current_epoch_batch_distance_sum = None
+            self.current_epoch_batch_distance_count = 0
+            self.epoch_count += 1
+            return
+
         # 将当前epoch的输出作为下一轮的历史参考
         self.prev_ensem_logits = self.current_epoch_ensem_logits.copy()
         # 清空当前记录
@@ -313,11 +376,55 @@ class ResNet(nn.Module):
         # 更新epoch计数
         self.epoch_count += 1
 
-    def record_epoch_logits(self, sample_ids, ensemble_logits):
+    def record_epoch_logits(
+            self, sample_ids, ensemble_logits, branch_logits=None):
         """Record gathered training logits under stable dataset indices."""
+        if self.history_granularity == 'batch':
+            if branch_logits is None:
+                raise ValueError(
+                    "batch history requires gathered branch_logits"
+                )
+            if (self.epoch_count >= 1
+                    and self.prev_batch_teacher_mean is not None):
+                with torch.no_grad():
+                    branch_mean_logits = (
+                        branch_logits.detach().mean(dim=0).transpose(0, 1)
+                    )
+                    teacher_mean = self.prev_batch_teacher_mean.to(
+                        device=branch_logits.device,
+                        dtype=branch_logits.dtype,
+                    )
+                    distances = compute_batch_dissimilarities(
+                        branch_mean_logits,
+                        teacher_mean,
+                        self.dissimilarity_metric,
+                    )
+                    if self.current_epoch_batch_distance_sum is None:
+                        self.current_epoch_batch_distance_sum = distances
+                    else:
+                        self.current_epoch_batch_distance_sum = (
+                            self.current_epoch_batch_distance_sum.to(
+                                branch_logits.device
+                            )
+                            + distances
+                        )
+                    self.current_epoch_batch_distance_count += 1
+            self.prev_batch_teacher_mean = (
+                ensemble_logits.detach().mean(dim=0)
+            )
+            return
         record_history_batch(
             self.current_epoch_ensem_logits, sample_ids, ensemble_logits
         )
+
+    def get_batch_branch_weights(self):
+        """Return current batch-level weights as a CPU list for logging."""
+        if self.history_granularity != 'batch':
+            return None
+        num_branches = self.num_branches if self.en else self.num_branches - 1
+        if self.epoch_count < 2 or self.batch_branch_weights is None:
+            return [1.0 / num_branches] * num_branches
+        return self.batch_branch_weights.detach().cpu().tolist()
         
     def forward(self, x, sample_ids=None):
         x = self.conv1(x)

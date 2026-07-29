@@ -34,6 +34,8 @@
 
 """
 import os
+import random
+import numpy as np
 import torch
 import torchvision
 import torchvision.transforms as transforms
@@ -52,12 +54,23 @@ class IndexedDataset(torch.utils.data.Dataset):
         return len(self.dataset)
 
 
+def seed_worker(worker_id):
+    """Seed Python/NumPy from the deterministic PyTorch worker seed."""
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
 def dataloader(data_name= "CIFAR100", batch_size= 64, num_workers = 8,
-               root = './Data', return_indices=False):
+               root = './Data', return_indices=False, seed=None):
     """
     Fetch and return train/test dataloader.
     """
-    kwargs = {'batch_size': batch_size, 'num_workers': num_workers, 'pin_memory': torch.cuda.is_available()}
+    kwargs = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': torch.cuda.is_available(),
+    }
     
     # normalize all the dataset
     if data_name == "CIFAR10":
@@ -123,8 +136,27 @@ def dataloader(data_name= "CIFAR100", batch_size= 64, num_workers = 8,
         trainset = IndexedDataset(trainset)
         testset = IndexedDataset(testset)
 
-    trainloader = torch.utils.data.DataLoader(trainset, shuffle = True, **kwargs)
-    
-    testloader = torch.utils.data.DataLoader(testset, shuffle = False, **kwargs)
+    train_generator = None
+    test_generator = None
+    if seed is not None:
+        train_generator = torch.Generator()
+        train_generator.manual_seed(seed)
+        test_generator = torch.Generator()
+        test_generator.manual_seed(seed + 1)
+        kwargs['worker_init_fn'] = seed_worker
+
+    trainloader = torch.utils.data.DataLoader(
+        trainset,
+        shuffle=True,
+        generator=train_generator,
+        **kwargs
+    )
+
+    testloader = torch.utils.data.DataLoader(
+        testset,
+        shuffle=False,
+        generator=test_generator,
+        **kwargs
+    )
 
     return trainloader, testloader

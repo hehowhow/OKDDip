@@ -20,13 +20,6 @@ import models.data_loader as data_loader
 import models
 import models.model_cifar as model_cifar
 from tensorboardX import SummaryWriter
-# Set the random seed for reproducible experiments
-random.seed(97)
-torch.manual_seed(97)
-# if torch.cuda.is_available(): 
-torch.cuda.manual_seed(97)
-torch.backends.cudnn.benchmark = True
-# torch.backends.cudnn.deterministic = True
 
 # Set parameters
 parser = argparse.ArgumentParser()
@@ -52,6 +45,10 @@ parser.add_argument('--num_workers', default=8, type=int, help = 'Input the numb
 parser.add_argument('--gpu_id', default='0', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
 parser.add_argument('--data_root', default='./Data', type=str,
                     help='Dataset root directory: default(./Data)')
+parser.add_argument('--seed', default=97, type=int,
+                    help='Random seed for model, sampler, and augmentations')
+parser.add_argument('--deterministic', action='store_true',
+                    help='Enable deterministic CUDA algorithms and data order')
 
 parser.add_argument('--num_branches', default=4, type=int, help = 'Input the number of branches: default(4)')
 parser.add_argument('--loss', default='KL', type=str, help = 'Define the loss between student output and group output: default(KL_Loss)')
@@ -66,6 +63,18 @@ parser.add_argument('--dissimilarity_metric', default='wasserstein1', type=str,
                     choices=['wasserstein1', 'wasserstein2', 'euclidean', 'kl', 'cosine'],
                     help = 'Dissimilarity metric for adaptive weighting: wasserstein1(default), wasserstein2, euclidean, kl, cosine')
 parser.add_argument('--tau', default=1.0, type=float, help = 'Temperature for softmax normalization in dissimilarity weighting: default(1.0)')
+parser.add_argument('--disable_adaptive_weighting', action='store_true',
+                    help='Disable historical dissimilarity weighting entirely')
+parser.add_argument(
+    '--history_granularity',
+    default='sample',
+    choices=['sample', 'batch'],
+    help=(
+        'Historical weighting mode: sample stores one teacher logit per '
+        'training sample; batch uses epoch-level branch weights derived from '
+        'consecutive batch means'
+    ),
+)
 parser.add_argument('--use_wandb', action='store_true', help = 'Use Weights & Biases for logging: default(False)')
 parser.add_argument('--wandb_project', default='PHR', type=str, help = 'W&B project name: default(OKDDip-GL)')
 parser.add_argument('--wandb_entity', default='swufe1hh-cstc', type=str, help = 'W&B entity (username or team): default(None)')
@@ -76,14 +85,40 @@ print(args)
 
 # Use CUDA
 os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+if args.deterministic:
+    os.environ.setdefault('CUBLAS_WORKSPACE_CONFIG', ':4096:8')
+
+random.seed(args.seed)
+np.random.seed(args.seed)
+torch.manual_seed(args.seed)
+torch.cuda.manual_seed_all(args.seed)
+torch.backends.cudnn.benchmark = not args.deterministic
+torch.backends.cudnn.deterministic = args.deterministic
+if args.deterministic:
+    torch.use_deterministic_algorithms(True)
+
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 pdist = nn.PairwiseDistance(p=2)
 
-def record_epoch_logits(model, sample_ids, ensemble_logits):
-    history_model = model.module if isinstance(model, nn.DataParallel) else model
-    if hasattr(history_model, 'record_epoch_logits'):
-        history_model.record_epoch_logits(sample_ids, ensemble_logits)
+def get_history_model(model):
+    return model.module if isinstance(model, nn.DataParallel) else model
+
+
+def adaptive_weighting_enabled(model):
+    return getattr(get_history_model(model), 'use_adaptive_weighting', False)
+
+
+def record_epoch_logits(model, sample_ids, ensemble_logits, branch_logits=None):
+    history_model = get_history_model(model)
+    if (getattr(history_model, 'use_adaptive_weighting', False)
+            and hasattr(history_model, 'record_epoch_logits')):
+        if getattr(history_model, 'history_granularity', 'sample') == 'batch':
+            history_model.record_epoch_logits(
+                sample_ids, ensemble_logits, branch_logits=branch_logits
+            )
+        else:
+            history_model.record_epoch_logits(sample_ids, ensemble_logits)
 
 
 def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args, consistency_weight):
@@ -116,7 +151,9 @@ def train(train_loader, model, optimizer, criterion, criterion_T, accuracy, args
             if len(model_output) == 4:
                 output_batch, x_m, x_stu, ensemble_logit = model_output
                 use_ensemble = True
-                record_epoch_logits(model, sample_ids, ensemble_logit)
+                record_epoch_logits(
+                    model, sample_ids, ensemble_logit, branch_logits=output_batch
+                )
             else:
                 output_batch, x_m, x_stu = model_output 
                 use_ensemble = False
@@ -423,13 +460,21 @@ def train_and_evaluate(model, train_loader, test_loader, optimizer, criterion, c
         test_metrics = evaluate(test_loader, model, criterion, criterion_T, accuracy, args, consistency_weight) 
         
         # 更新历史记录（在epoch结束时）
-        if hasattr(model, 'update_epoch_history'):
+        if adaptive_weighting_enabled(model):
             # 如果使用DataParallel
             if isinstance(model, nn.DataParallel):
                 model.module.update_epoch_history()
             else:
                 model.update_epoch_history()
             logging.info(f"- Updated epoch history. Epoch count: {model.epoch_count if not isinstance(model, nn.DataParallel) else model.module.epoch_count}")
+            history_model = get_history_model(model)
+            if hasattr(history_model, 'get_batch_branch_weights'):
+                batch_weights = history_model.get_batch_branch_weights()
+                if batch_weights is not None:
+                    logging.info(
+                        "- Batch history branch weights for next epoch: %s",
+                        ", ".join(f"{weight:.6f}" for weight in batch_weights),
+                    )
         
         # Find the best accTop1 for Branch1.
         if choose_E:
@@ -563,6 +608,7 @@ if __name__ == '__main__':
         num_workers=args.num_workers,
         root=root,
         return_indices=True,
+        seed=args.seed,
     )
     logging.info("- Done.")
     
@@ -580,17 +626,34 @@ if __name__ == '__main__':
             model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches, 
                                                    input_channel=utils.lookup(args.model), 
                                                    dissimilarity_metric=args.dissimilarity_metric,
-                                                   tau=args.tau)
+                                                   tau=args.tau,
+                                                   history_granularity=args.history_granularity)
         elif "vgg" in args.model:
+            if args.history_granularity == 'batch':
+                raise ValueError(
+                    "--history_granularity batch currently supports ResNet GL models"
+                )
             model_cfg = getattr(model_fd, 'vgg_GL')
             model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches,
                                                    dissimilarity_metric=args.dissimilarity_metric,
                                                    tau=args.tau)
         elif "densenet" in args.model:
+            if args.history_granularity == 'batch':
+                raise ValueError(
+                    "--history_granularity batch currently supports ResNet GL models"
+                )
             model_cfg = getattr(model_fd, 'densenet_GL')
             model = getattr(model_cfg, args.model)(num_classes = num_classes, num_branches = args.num_branches,
                                                    dissimilarity_metric=args.dissimilarity_metric,
                                                    tau=args.tau)
+
+        if hasattr(model, 'use_adaptive_weighting'):
+            model.use_adaptive_weighting = not args.disable_adaptive_weighting
+            logging.info(
+                "- Historical dissimilarity weighting: %s (granularity=%s)",
+                "enabled" if model.use_adaptive_weighting else "disabled",
+                args.history_granularity,
+            )
         
         
     if torch.cuda.device_count() > 1:

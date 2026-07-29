@@ -7,6 +7,9 @@ Peers (OKDDip)**，并加入了基于上一 epoch ensemble logit 相异度的自
 重新打乱，同一个索引仍会读取该样本上一 epoch 的 ensemble logit。验证阶段与训练
 历史完全隔离，不会再覆盖训练缓存。
 
+ResNet GL 训练还提供轻量的 batch 级历史模式。该模式不保存逐样本 logit，
+而是根据相邻训练 batch 的均值 logit，在每轮结束时生成下一轮使用的固定分支权重。
+
 ## 环境准备
 
 建议使用带 CUDA 的 Python 环境。训练脚本当前直接调用 CUDA，因此不能仅使用 CPU
@@ -53,6 +56,22 @@ python train_GL.py \
   --gpu_id 0
 ```
 
+运行 batch 级历史加权版本：
+
+```bash
+python train_GL.py \
+  --model resnet32 \
+  --dataset CIFAR10 \
+  --data_root ./Data \
+  --history_granularity batch \
+  --dissimilarity_metric wasserstein1 \
+  --tau 1.5 \
+  --lambda_ensemble 0.5 \
+  --seed 97 \
+  --deterministic \
+  --gpu_id 0
+```
+
 使用多张 GPU：
 
 ```bash
@@ -80,6 +99,10 @@ python train_GL.py \
 | `--lambda_ensemble` | `0.5` | ensemble logit 与原教师信号的融合比例 |
 | `--dissimilarity_metric` | `wasserstein1` | `wasserstein1`、`wasserstein2`、`euclidean`、`kl` 或 `cosine` |
 | `--tau` | `1.0` | 相异度 softmax 的温度 |
+| `--history_granularity` | `sample` | `sample` 为逐样本历史；`batch` 为轻量 batch 历史（当前用于 ResNet GL） |
+| `--disable_adaptive_weighting` | 关闭 | 完全关闭历史与相异度加权，运行原型路径 |
+| `--seed` | `97` | 模型、采样顺序和数据增强的随机种子 |
+| `--deterministic` | 关闭 | 启用确定性 CUDA 算法 |
 | `--schedule` | `150 225` | 学习率衰减 epoch |
 | `--gpu_id` | `0` | 可见 GPU，例如 `0` 或 `0,1` |
 | `--resume` | 空 | 包含 `last.pth` 的实验目录 |
@@ -106,12 +129,27 @@ python train_GL.py --help
 ensemble logit 计算相异度。随机裁剪和翻转仍会产生不同增强视图，但底层数据集样本
 保持一致。验证前向不读取训练历史，也不写入历史缓存。
 
+## Batch 级历史的工作方式
+
+使用 `--history_granularity batch` 时，每个训练 batch 执行以下过程：
+
+1. 对每个普通分支的 student logits 沿 batch 维求均值。
+2. 与前一个训练 batch 的 teacher logits 均值计算相异度。
+3. 将本轮所有 batch 的分支相异度求平均。
+4. 在 epoch 结束时通过 `softmax(distance / tau)` 得到分支权重。
+5. 该固定权重从下一个 epoch 开始用于生成 teacher logit。
+
+epoch 0 和 epoch 1 始终使用等权重；epoch 1 收集的相异度从 epoch 2 开始生效。
+验证 batch 不参与历史统计。该模式只保存一个 teacher 均值、每个分支的距离累计值
+和权重，空间复杂度从逐样本模式的 `O(样本数 × 类别数)` 降为
+`O(分支数 + 类别数)`。
+
 ## 测试
 
 运行样本索引和历史查找的回归测试：
 
 ```bash
-python -m unittest tests.test_logit_history
+python -m unittest tests.test_logit_history tests.test_batch_logit_history
 ```
 
 进行语法检查：
